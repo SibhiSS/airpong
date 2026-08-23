@@ -109,6 +109,7 @@ const state = {
   serving: 'you',
   paused: true,
   dancing: false,
+  playerHandled: false, cpuHandled: false,
 }
 
 const GRAVITY = -3.4;
@@ -133,6 +134,10 @@ function serve(who) {
     b.x = 0; b.y = 0.35; b.z = CPU_Z;
     b.vx = 0; b.vy = 1.6; b.vz = -state.rallySpeed * 1.6;   // toward player: decreasing z
   }
+  // Each side gets exactly one attempt per approach; these latches are what
+  // enforce that (see the CPU contact zone in step() for why).
+  state.playerHandled = (who === 'you');
+  state.cpuHandled = (who === 'cpu');
   b.active = true;
   state.paused = false;
 }
@@ -159,24 +164,55 @@ function showMsg(title, sub) {
 }
 function hideMsg() { document.getElementById('msg').style.display = 'none'; }
 
-function reflect(b, towardZ, fromX, fromY, power) {
-  // Aim roughly at the far/near center, with contact offset steering it —
-  // exactly the same idea as the reference project's handleHit, just with a
-  // real net-height/gravity check instead of an instant teleport.
-  const targetX = Math.max(-TABLE_W * 0.85, Math.min(TABLE_W * 0.85, fromX * 1.4));
-  const travelZ = Math.abs(towardZ - b.z);
-  const travelTime = travelZ / (power * 2.6);
-  b.vx = (targetX - b.x) / Math.max(travelTime, 0.15);
-  b.vy = 2.0 + Math.abs(fromY) * 1.4;
-  b.vz = (towardZ - b.z) / Math.max(travelTime, 0.15);
+// Solve the arc that LANDS on the opponent's half, instead of picking an
+// upward velocity out of thin air.
+//
+// The previous version did `vy = 2.0 + |ball.y - paddle.y| * 1.4`, i.e. the
+// higher the ball was when struck, the harder it got hit upward — a positive
+// feedback loop that doubled the ball's height every rally until it left the
+// world entirely (measured: 1.5e54 after ~20 hits, with the on-table shadow
+// left behind as the only visible trace).
+//
+// Here vy is DERIVED: given where the ball is now, where it must land, and
+// gravity, there is exactly one vertical velocity that gets it there in time
+// T. A ball that is already too high simply gets a negative vy. The loop
+// cannot run away because height is an input to the solve, not a gain on it.
+function reflect(b, towardSide, fromX, power) {
+  // Land somewhere on the far half, short of the back edge.
+  const landZ = towardSide > 0
+    ? NET_Z + 0.35 + Math.random() * Math.max(0.1, (TABLE_FAR_Z - 0.25) - (NET_Z + 0.35))
+    : NET_Z - 0.35 - Math.random() * Math.max(0.1, (NET_Z - 0.35) - (TABLE_NEAR_Z + 0.25));
+
+  const dz = landZ - b.z;
+  const T = Math.max(0.28, Math.abs(dz) / (2.2 * power));
+
+  // Contact offset steers placement left/right.
+  const targetX = Math.max(-TABLE_W * 0.8, Math.min(TABLE_W * 0.8, b.x + fromX * 1.6));
+  b.vx = (targetX - b.x) / T;
+  b.vz = dz / T;
+
+  // y(T) = y0 + vy*T + 0.5*g*T^2  =>  solve for vy such that y(T) = table.
+  const landY = TABLE_Y + 0.035;
+  b.vy = (landY - b.y - 0.5 * GRAVITY * T * T) / T;
 }
 
 function step(dt) {
   if (state.paused || !state.ball.active) return;
   const b = state.ball;
 
+  const prevZ = b.z;
   b.vy += GRAVITY * dt;
   b.x += b.vx * dt; b.y += b.vy * dt; b.z += b.vz * dt;
+
+  // Sanity guard. Nothing in a table tennis rally legitimately reaches 8m up
+  // or 50 m/s, so if it happens some physics path has gone wrong — end the
+  // point instead of letting the ball escape to infinity (which is exactly
+  // what the old reflect() feedback loop did, reaching y=1e54 while the
+  // on-table shadow was the only thing still visible on screen).
+  if (!isFinite(b.y) || b.y > 8 || Math.hypot(b.vx, b.vy, b.vz) > 50) {
+    pointTo('cpu');
+    return;
+  }
 
   // Table bounce (only over the table's depth span).
   if (b.y <= TABLE_Y + 0.035 && b.vy < 0 && b.z > TABLE_NEAR_Z - 0.1 && b.z < TABLE_FAR_Z + 0.1) {
@@ -184,8 +220,11 @@ function step(dt) {
     b.vy *= -RESTITUTION;
   }
 
-  // Net: a thin wall at NET_Z, only blocks low shots.
-  if (Math.abs(b.z - NET_Z) < 0.03 && b.y < 0.14) {
+  // Net. Tested as a CROSSING (prevZ vs z), not "is z within 0.03 of the
+  // net" — at rally speed the ball moves far more than 0.03 per frame and
+  // would tunnel straight through a thin band without ever registering.
+  if ((prevZ - NET_Z) * (b.z - NET_Z) <= 0 && b.y < 0.14) {
+    b.z = prevZ;
     b.vz *= -0.3; b.vx *= 0.5;
   }
 
@@ -194,25 +233,31 @@ function step(dt) {
   // it bounces back. Simpler and much more reliable to actually play than
   // requiring a well-timed swing; swing detection stays live in the
   // telemetry (flags/swingPeak) for whenever a harder mode wants it back.
-  if (b.z <= PADDLE_Z + 0.06 && b.vz < 0 && b.z > PADDLE_Z - 0.45) {
-    const dx = b.x - state.paddleX, dy = b.y - state.paddleY;
+  if (b.z <= PADDLE_Z + 0.06 && b.vz < 0 && b.z > PADDLE_Z - 0.45 && !state.playerHandled) {
+    state.playerHandled = true;
+    const dx = b.x - state.paddleX;
     if (Math.abs(dx) < PADDLE_HIT_RADIUS_X) {
-      reflect(b, CPU_Z, dx, dy, 1.6);
+      state.rallySpeed = Math.min(state.rallySpeed + 0.06, 2.6);
+      reflect(b, +1, dx, state.rallySpeed);
       b.z = PADDLE_Z + 0.07;
+      state.cpuHandled = false;      // arm the CPU's single attempt
     }
   }
   // Missed it entirely, ball keeps going past you.
   if (b.z < PADDLE_Z - 0.35) { pointTo('cpu'); return; }
 
-  // CPU contact zone (simple, tracks the ball, occasionally errs at high rally speed).
-  if (b.z >= CPU_Z - 0.06 && b.vz > 0 && b.z < CPU_Z + 0.3) {
-    // A CPU that basically never misses isn't a fair opponent, it's a wall —
-    // this baseline makes it genuinely beatable, with a bit more pressure
-    // as rallies stretch on.
+  // CPU contact zone. The `cpuHandled` latch matters: this block is true for
+  // every frame the ball spends inside the zone (~36 of them), and rolling
+  // the miss chance on each one meant the CPU got 36 independent attempts —
+  // P(miss all) = 0.28^36 ~= 0, so a nominal 28% miss rate produced an
+  // opponent that literally never lost a point. Decide ONCE per approach.
+  if (b.z >= CPU_Z - 0.06 && b.vz > 0 && !state.cpuHandled) {
+    state.cpuHandled = true;
     const missChance = Math.min(0.55, 0.28 + Math.max(0, state.rallySpeed - 1.6) * 0.06);
     if (Math.random() > missChance) {
-      reflect(b, PADDLE_Z, b.x - state.cpuX, 0, state.rallySpeed);
+      reflect(b, -1, b.x - state.cpuX, state.rallySpeed);
       b.z = CPU_Z - 0.07;
+      state.playerHandled = false;   // arm the player's single attempt
     }
   }
   if (b.z > CPU_Z + 0.35) { pointTo('you'); return; }
@@ -271,56 +316,71 @@ function drawPaddle(x, y, z, color, isPlayer) {
 // center — "standing still" — only the arm reaches out to wherever the
 // paddle (handX) currently is, tracking the ball. On a CPU win it dances
 // instead: a silly, obviously-procedural wiggle, not a real animation rig.
-function drawOpponent(handX, t, dancing) {
-  const standX = 0;
-  const bodyZ = CPU_Z + 0.12;
+// Drawn in SCREEN space, anchored to the table's far edge — not in world
+// space. The opponent is decoration: it never needs to be depth-correct, and
+// putting it through the perspective divide at that distance squashed the
+// whole body into a few dozen pixels where the head, torso and racket all
+// landed on top of each other. Anchoring to the projected far edge keeps it
+// correctly placed and correctly scaled at any aspect ratio, while the
+// proportions stay under direct control.
+function drawOpponent(cpuWorldX, t, dancing) {
+  const anchor = project(0, TABLE_Y, TABLE_FAR_Z);
+  const edgeR = project(TABLE_W, TABLE_Y, TABLE_FAR_Z);
+  const halfW = Math.max(1, edgeR.x - anchor.x);
+
+  const u = Math.max(7, H * 0.030);          // one body unit, in pixels
   const wiggle = dancing ? Math.sin(t * 9) : 0;
-  const bob = dancing ? Math.abs(Math.sin(t * 9)) * 0.12 : 0;
-  const headY = 1.05 + bob, hipY = 0.55 + bob * 0.6;
+  const bob = dancing ? Math.abs(Math.sin(t * 9)) * u * 0.5 : 0;
 
-  // Everything on ONE depth plane (bodyZ) — like a paper cutout facing the
-  // camera. Mixing depths between the shoulder and the reaching hand (an
-  // earlier version put the hand at CPU_Z, closer to camera than the rest of
-  // the body) makes the two ends of the same line project at different
-  // scales, which is exactly what read as "the arm is separate from the
-  // body". One plane means the arm can never visually detach from its own
-  // shoulder, at the cost of not literally reaching toward the ball's true
-  // depth — a fair trade for a cosmetic stick figure.
-  const head = project(standX + wiggle * 0.06, headY, bodyZ);
-  const hip = project(standX, hipY, bodyZ);
-  const footL = project(standX - (dancing ? 0.18 + wiggle * 0.1 : 0.12), TABLE_Y, bodyZ);
-  const footR = project(standX + (dancing ? 0.18 - wiggle * 0.1 : 0.12), TABLE_Y, bodyZ);
-  const shoulder = project(standX, 0.85 + bob, bodyZ);
-  const offShoulder = project(standX - 0.12, 0.85 + bob, bodyZ);
+  const cx = anchor.x + wiggle * u * 0.25;
+  const footY = anchor.y - u * 0.2 - bob;     // stands just behind the far edge
+  const hipY = footY - u * 1.5;
+  const shoulderY = footY - u * 3.0;
+  const headY = footY - u * 3.7;
+  const headR = u * 0.62;
 
-  // World-space hand position, used both for the arm line and the racket
-  // itself, so they always agree on where the "hand" actually is.
-  const handWx = dancing ? standX + Math.sin(t * 9 + 1.5) * 0.4 : handX;
-  const handWy = dancing ? 1.0 + Math.abs(Math.sin(t * 9 + 1.5)) * 0.3 : 0.55;
-  const handWz = bodyZ;
-  const hand = project(handWx, handWy, handWz);
-  const offHand = dancing
-    ? project(standX - Math.sin(t * 9 + 1.5) * 0.4, 1.0 + Math.abs(Math.sin(t * 9)) * 0.3, bodyZ)
-    : project(standX - 0.18, 0.55, bodyZ);
+  // The playing hand tracks the ball in x, mapped through the table's own
+  // on-screen width so it always lines up with where the CPU actually is.
+  // The +1.4u bias holds the bat out to the side of the body. Without it, a
+  // centred ball puts the hand exactly on the torso line and the racket is
+  // drawn over the chest.
+  const handScreenX = dancing
+    ? cx + Math.sin(t * 9 + 1.5) * u * 2.0
+    : anchor.x + (cpuWorldX / TABLE_W) * halfW + u * 1.4;
+  const handScreenY = dancing ? headY - u * 1.1 - bob : shoulderY + u * 0.35;
+  const offX = dancing ? cx - Math.sin(t * 9 + 1.5) * u * 2.0 : cx - u * 1.6;
+  const offY = dancing ? headY - u * 1.1 : hipY + u * 0.1;
 
-  ctx.strokeStyle = '#e6edf3'; ctx.lineWidth = 4; ctx.lineCap = 'round';
-  ctx.beginPath(); ctx.moveTo(shoulder.x, shoulder.y); ctx.lineTo(hip.x, hip.y); ctx.stroke();      // torso
-  ctx.beginPath(); ctx.moveTo(hip.x, hip.y); ctx.lineTo(footL.x, footL.y); ctx.stroke();            // left leg
-  ctx.beginPath(); ctx.moveTo(hip.x, hip.y); ctx.lineTo(footR.x, footR.y); ctx.stroke();            // right leg
-  ctx.strokeStyle = '#ff6b6b';
-  ctx.beginPath(); ctx.moveTo(shoulder.x, shoulder.y); ctx.lineTo(hand.x, hand.y); ctx.stroke();     // paddle arm
-  ctx.beginPath(); ctx.moveTo(offShoulder.x, offShoulder.y); ctx.lineTo(offHand.x, offHand.y); ctx.stroke(); // other arm
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
 
-  const headR = Math.max(10, 16 * head.scale / H * 3);
-  ctx.fillStyle = '#ffcc99';
-  ctx.beginPath(); ctx.arc(head.x, head.y, headR, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = '#e6edf3';
+  ctx.lineWidth = Math.max(2, u * 0.26);
+  ctx.beginPath(); ctx.moveTo(cx, shoulderY); ctx.lineTo(cx, hipY); ctx.stroke();          // torso
+  ctx.beginPath();                                                                          // legs
+  ctx.moveTo(cx, hipY); ctx.lineTo(cx - u * (dancing ? 1.1 : 0.6) + wiggle * u * 0.3, footY);
+  ctx.moveTo(cx, hipY); ctx.lineTo(cx + u * (dancing ? 1.1 : 0.6) - wiggle * u * 0.3, footY);
+  ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(cx, shoulderY); ctx.lineTo(offX, offY); ctx.stroke();         // off arm
+
+  ctx.strokeStyle = '#ffb3b3';                                                              // playing arm
+  ctx.beginPath(); ctx.moveTo(cx, shoulderY); ctx.lineTo(handScreenX, handScreenY); ctx.stroke();
+
+  ctx.fillStyle = '#ffcc99';                                                                // head
+  ctx.beginPath(); ctx.arc(cx, headY, headR, 0, Math.PI * 2); ctx.fill();
   if (dancing) {
-    // a little grin — purely cosmetic, purely silly
-    ctx.strokeStyle = '#663300'; ctx.lineWidth = 2;
-    ctx.beginPath(); ctx.arc(head.x, head.y + headR * 0.15, headR * 0.5, 0.15 * Math.PI, 0.85 * Math.PI); ctx.stroke();
+    ctx.strokeStyle = '#7a3d00';
+    ctx.lineWidth = Math.max(1.5, u * 0.14);
+    ctx.beginPath();
+    ctx.arc(cx, headY + headR * 0.05, headR * 0.55, 0.15 * Math.PI, 0.85 * Math.PI);
+    ctx.stroke();
   }
 
-  drawPaddle(handWx, handWy, handWz, '#ff6b6b', false);
+  // Racket last so it reads as held in front of the arm.
+  const pr = u * 0.78;
+  ctx.fillStyle = '#ff6b6b';
+  ctx.beginPath(); ctx.ellipse(handScreenX, handScreenY, pr, pr * 0.68, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = 'rgba(0,0,0,0.4)'; ctx.lineWidth = Math.max(1.5, u * 0.14); ctx.stroke();
 }
 
 function drawBall() {
