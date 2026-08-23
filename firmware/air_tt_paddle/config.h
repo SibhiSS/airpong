@@ -48,6 +48,25 @@ static const uint16_t SEND_INTERVAL_MS_MAX = 100;    // 10 Hz floor
 #define STA_PASSWORD     ""
 #define STA_CONNECT_TIMEOUT_MS 8000
 
+// ---------------- drift correction ----------------
+// A MEMS gyro's zero-rate output is never exactly zero and moves as the part
+// warms up, so the one-shot calibration at boot goes stale within minutes.
+// The fused angle then leans steadily to one side and the on-screen paddle
+// "drags" toward an edge, which is what makes one side of the table hard to
+// reach. Two continuous corrections, both only active while the paddle is
+// genuinely still:
+//
+//   1. bias tracking  - if it is not moving, any rate the gyro reports IS
+//                       bias, so fold a little of it back into the offset.
+//   2. auto re-centre - pull the zero point gently toward the current pose,
+//                       slowly enough that deliberately holding an angle for
+//                       a moment does not steal your aim.
+static const float STILL_GYRO_DPS = 6.0f;    // all axes under this => not rotating
+static const float STILL_ACC_TOL  = 0.08f;   // |a| within this of 1g => not accelerating
+static const uint32_t STILL_MS_BEFORE_RECENTRE = 1200;
+static const float GYRO_BIAS_TRACK = 0.0020f;  // per-sample, ~2.5s time constant at 200Hz
+static const float AUTO_ZERO_RATE  = 0.0015f;  // per-sample, ~3.3s time constant at 200Hz
+
 // ---------------- swing detection ----------------
 // Phase 0 measured ~2 dps at rest and 869 dps peak on a hard real swing —
 // these sit deliberately between "aiming the paddle by tilting" and "an

@@ -22,6 +22,7 @@ static float rollF = 0, pitchF = 0;             // fused, unzeroed
 static float zeroRoll = 0, zeroPitch = 0;
 static uint32_t lastUpdateUs = 0;
 static bool firstSample = true;
+static uint32_t stillSinceMs = 0;   // 0 = currently moving
 
 static bool wr(uint8_t reg, uint8_t val) {
   Wire.beginTransmission(mpuAddr);
@@ -108,6 +109,7 @@ bool imuInit() {
   calibrate();
   lastUpdateUs = micros();
   firstSample = true;
+  stillSinceMs = 0;
   return true;
 }
 
@@ -167,6 +169,32 @@ ImuSample imuUpdate() {
     pitchF = FUSION_ALPHA * (pitchF + gy * dt) + (1 - FUSION_ALPHA) * pitchAcc;
   }
 
+  // ---- continuous drift correction while the paddle is still ----
+  // See config.h for why this exists: without it the fused angle slowly leans
+  // to one side as the gyro's zero-rate output wanders, and the paddle ends up
+  // parked off-centre so one side of the table becomes hard to reach.
+  const float aMag = sqrtf(ax * ax + ay * ay + az * az);
+  const bool still = fabsf(gx) < STILL_GYRO_DPS &&
+                     fabsf(gy) < STILL_GYRO_DPS &&
+                     fabsf(gz) < STILL_GYRO_DPS &&
+                     fabsf(aMag - 1.0f) < STILL_ACC_TOL;
+
+  if (still) {
+    // gx/gy/gz are already bias-corrected, so nudging the stored offset by a
+    // fraction of what remains drives the corrected rate toward zero.
+    offGx += gx * GYRO_BIAS_TRACK;
+    offGy += gy * GYRO_BIAS_TRACK;
+    offGz += gz * GYRO_BIAS_TRACK;
+
+    if (stillSinceMs == 0) stillSinceMs = millis();
+    if (millis() - stillSinceMs > STILL_MS_BEFORE_RECENTRE) {
+      zeroRoll  += (rollF  - zeroRoll)  * AUTO_ZERO_RATE;
+      zeroPitch += (pitchF - zeroPitch) * AUTO_ZERO_RATE;
+    }
+  } else {
+    stillSinceMs = 0;
+  }
+
   s.roll_deg  = rollF  - zeroRoll;
   s.pitch_deg = pitchF - zeroPitch;
   s.wx_dps = gx; s.wy_dps = gy; s.wz_dps = gz;
@@ -178,6 +206,7 @@ void imuZero() {
   zeroRoll = rollF;
   zeroPitch = pitchF;
   calibrated = true;
+  stillSinceMs = 0;   // a manual re-zero restarts the auto-recentre timer
   Serial.println("-- re-zeroed --");
 }
 
