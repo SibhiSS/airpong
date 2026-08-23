@@ -1,0 +1,446 @@
+// Auto-generated from web/game.html by tools/embed_pages.py — do not hand-edit.
+// Regenerate after editing that file:  python tools/embed_pages.py
+#pragma once
+#include <Arduino.h>   // for PROGMEM — must precede its use regardless of include order elsewhere
+
+static const char GAME_HTML[] PROGMEM = R"AIRTTGAME(
+<!DOCTYPE html>
+<!--
+  Air TT — playable v1.
+
+  Real physics (gravity, table bounce, net, simple spin-free trajectory),
+  driven by live roll/pitch from the paddle over the same WebSocket protocol
+  scope.html uses. No swing detection yet (Phase 3) — you hit by positioning
+  the paddle where the ball arrives, same control feel as the reference
+  project, but everything downstream of "where is the paddle" is a real sim
+  instead of a tilt demo.
+
+  Served by the ESP32 itself at "/" — join AirTT-222C, load this IP, play.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Air TT</title>
+<style>
+  :root{ --bg:#0a0e14; --line:#2a323d; --fg:#e6edf3; --dim:#8b949e; --accent:#4dabf7; --miss:#ff6b6b; --ok:#2ed573; }
+  *{box-sizing:border-box; -webkit-tap-highlight-color:transparent}
+  html,body{margin:0;height:100%;overflow:hidden;background:var(--bg);
+            font:14px/1.4 ui-monospace,"Cascadia Code",Consolas,monospace;color:var(--fg);
+            touch-action:none;user-select:none}
+  #wrap{position:fixed;inset:0}
+  canvas{display:block;width:100%;height:100%}
+  #hud{position:fixed;top:0;left:0;right:0;display:flex;justify-content:space-between;
+       align-items:center;padding:10px 14px;pointer-events:none;font-size:13px}
+  #hud b{font-size:22px;font-weight:700}
+  #status{display:flex;gap:8px;align-items:center;color:var(--dim)}
+  #dot{width:8px;height:8px;border-radius:50%;background:var(--miss)}
+  #dot.live{background:var(--ok)}
+  #controls{position:fixed;bottom:14px;right:14px;display:flex;gap:8px;pointer-events:auto}
+  #controls button{padding:10px 14px;border-radius:8px;background:#21262d;
+                    border:1px solid var(--line);color:var(--fg);font:inherit;font-size:12px}
+  #controls button.on{background:var(--accent);border-color:var(--accent);color:#04121f}
+  #msg{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center;
+       display:none;pointer-events:none}
+  #msg h1{font-size:28px;margin:0 0 6px}
+  #msg p{color:var(--dim);margin:0}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="c"></canvas>
+  <div id="hud">
+    <div>YOU <b id="scoreYou">0</b> &nbsp;–&nbsp; <b id="scoreCpu">0</b> CPU</div>
+    <div id="status"><span id="dot"></span><span id="statusText">connecting…</span></div>
+  </div>
+  <div id="msg"><h1 id="msgTitle"></h1><p id="msgSub"></p></div>
+  <div id="controls">
+    <button id="rezero">Re-zero</button>
+    <button id="swapAxes">Swap axes</button>
+    <button id="invertX">Invert X</button>
+  </div>
+</div>
+
+<script>
+/* ---------------- geometry (a simple perspective table, no 3D engine) ---------------- */
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+let W = 0, H = 0;
+function resize() {
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  W = innerWidth; H = innerHeight;
+  cv.width = W * dpr; cv.height = H * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+addEventListener('resize', resize);
+resize();
+
+// Table in world units: X across [-1,1], Z depth [0 (your edge) .. 3 (far edge)],
+// Y height above the table surface. Projected with a tilted-camera perspective
+// divide — enough to read depth and height, no WebGL needed.
+//
+// The camera is elevated and pitched DOWN to look at the table (like an
+// over-the-shoulder sports-game view), not looking level. A level-camera
+// formula (plain "screenY = origin - (y-camY)*scale") looks fine for distant
+// objects but blows up for anything close and low — which is exactly what
+// your own paddle is. Rotating camera-space by the tilt angle before the
+// perspective divide is what fixes that at the source.
+const NET_Z = 1.5;
+const TABLE_W = 1.0, TABLE_NEAR_Z = 0.0, TABLE_FAR_Z = 3.0;
+const CAM_Y = 1.3, CAM_Z = -1.6;
+const CAM_TILT = 30 * Math.PI / 180;
+const FOV = 1.0, Y_ORIGIN = 0.55;
+const cosT = Math.cos(CAM_TILT), sinT = Math.sin(CAM_TILT);
+
+function project(x, y, z) {
+  const ty = y - CAM_Y, tz = z - CAM_Z;
+  const ty2 = ty * cosT + tz * sinT;
+  const tz2 = Math.max(-ty * sinT + tz * cosT, 0.05);   // never divide by ~0 or negative (behind camera)
+  const scale = (H * FOV) / tz2;
+  return { x: W / 2 + x * scale, y: H * Y_ORIGIN - ty2 * scale, scale };
+}
+
+/* ---------------- game state ---------------- */
+const state = {
+  paddleX: 0, paddleY: 0.20,     // single-axis control: only X is tilt-driven, Y is fixed
+  cpuX: 0,
+  ball: { x: 0, y: 0.3, z: TABLE_FAR_Z - 0.3, vx: 0, vy: 0, vz: 0, active: false },
+  scoreYou: 0, scoreCpu: 0,
+  rallySpeed: 1.6,
+  serving: 'you',
+  paused: true,
+  dancing: false,
+}
+
+const GRAVITY = -3.4;
+const TABLE_Y = 0.0;
+const RESTITUTION = 0.68;
+const PADDLE_HIT_RADIUS_X = 0.32, PADDLE_HIT_RADIUS_Y = 0.32;
+const PADDLE_Z = TABLE_NEAR_Z + 0.05;
+const CPU_Z = TABLE_FAR_Z - 0.05;
+
+function serve(who) {
+  state.serving = who;
+  const b = state.ball;
+  // z runs 0 (player, PADDLE_Z) -> 3 (CPU, CPU_Z). "Away from you" is
+  // therefore INCREASING z. This was inverted — a 'you' serve sent the ball
+  // toward negative z, i.e. through the camera, which is exactly the
+  // "flies off, huge shadow" symptom: near-zero camera-space depth makes the
+  // perspective divide (project()) blow up.
+  if (who === 'you') {
+    b.x = state.paddleX; b.y = 0.35; b.z = PADDLE_Z;
+    b.vx = 0; b.vy = 1.6; b.vz = state.rallySpeed * 1.6;    // toward CPU: increasing z
+  } else {
+    b.x = 0; b.y = 0.35; b.z = CPU_Z;
+    b.vx = 0; b.vy = 1.6; b.vz = -state.rallySpeed * 1.6;   // toward player: decreasing z
+  }
+  b.active = true;
+  state.paused = false;
+}
+
+function endGame() {
+  state.paused = true;
+  const won = state.scoreYou > state.scoreCpu;
+  state.dancing = !won;   // the CPU only celebrates when it actually wins
+  showMsg(won ? 'You win' : 'CPU wins', `${state.scoreYou} – ${state.scoreCpu}. Tap to play again.`);
+}
+
+function pointTo(who) {
+  if (who === 'you') state.scoreYou++; else state.scoreCpu++;
+  if (state.scoreYou >= 11 || state.scoreCpu >= 11) { endGame(); return; }
+  state.ball.active = false;
+  state.rallySpeed = 1.6;
+  setTimeout(() => serve(who === 'you' ? 'you' : 'cpu'), 700);
+}
+
+function showMsg(title, sub) {
+  document.getElementById('msgTitle').textContent = title;
+  document.getElementById('msgSub').textContent = sub;
+  document.getElementById('msg').style.display = 'block';
+}
+function hideMsg() { document.getElementById('msg').style.display = 'none'; }
+
+function reflect(b, towardZ, fromX, fromY, power) {
+  // Aim roughly at the far/near center, with contact offset steering it —
+  // exactly the same idea as the reference project's handleHit, just with a
+  // real net-height/gravity check instead of an instant teleport.
+  const targetX = Math.max(-TABLE_W * 0.85, Math.min(TABLE_W * 0.85, fromX * 1.4));
+  const travelZ = Math.abs(towardZ - b.z);
+  const travelTime = travelZ / (power * 2.6);
+  b.vx = (targetX - b.x) / Math.max(travelTime, 0.15);
+  b.vy = 2.0 + Math.abs(fromY) * 1.4;
+  b.vz = (towardZ - b.z) / Math.max(travelTime, 0.15);
+}
+
+function step(dt) {
+  if (state.paused || !state.ball.active) return;
+  const b = state.ball;
+
+  b.vy += GRAVITY * dt;
+  b.x += b.vx * dt; b.y += b.vy * dt; b.z += b.vz * dt;
+
+  // Table bounce (only over the table's depth span).
+  if (b.y <= TABLE_Y + 0.035 && b.vy < 0 && b.z > TABLE_NEAR_Z - 0.1 && b.z < TABLE_FAR_Z + 0.1) {
+    b.y = TABLE_Y + 0.035;
+    b.vy *= -RESTITUTION;
+  }
+
+  // Net: a thin wall at NET_Z, only blocks low shots.
+  if (Math.abs(b.z - NET_Z) < 0.03 && b.y < 0.14) {
+    b.vz *= -0.3; b.vx *= 0.5;
+  }
+
+  // Player contact zone (near baseline, moving toward you). Single-axis
+  // arcade deflect: no swing required, no Y check — close enough in X and
+  // it bounces back. Simpler and much more reliable to actually play than
+  // requiring a well-timed swing; swing detection stays live in the
+  // telemetry (flags/swingPeak) for whenever a harder mode wants it back.
+  if (b.z <= PADDLE_Z + 0.06 && b.vz < 0 && b.z > PADDLE_Z - 0.45) {
+    const dx = b.x - state.paddleX, dy = b.y - state.paddleY;
+    if (Math.abs(dx) < PADDLE_HIT_RADIUS_X) {
+      reflect(b, CPU_Z, dx, dy, 1.6);
+      b.z = PADDLE_Z + 0.07;
+    }
+  }
+  // Missed it entirely, ball keeps going past you.
+  if (b.z < PADDLE_Z - 0.35) { pointTo('cpu'); return; }
+
+  // CPU contact zone (simple, tracks the ball, occasionally errs at high rally speed).
+  if (b.z >= CPU_Z - 0.06 && b.vz > 0 && b.z < CPU_Z + 0.3) {
+    // A CPU that basically never misses isn't a fair opponent, it's a wall —
+    // this baseline makes it genuinely beatable, with a bit more pressure
+    // as rallies stretch on.
+    const missChance = Math.min(0.55, 0.28 + Math.max(0, state.rallySpeed - 1.6) * 0.06);
+    if (Math.random() > missChance) {
+      reflect(b, PADDLE_Z, b.x - state.cpuX, 0, state.rallySpeed);
+      b.z = CPU_Z - 0.07;
+    }
+  }
+  if (b.z > CPU_Z + 0.35) { pointTo('you'); return; }
+
+  // CPU paddle tracks the ball's x with a speed cap — imperfect, not psychic.
+  const cpuTarget = Math.max(-TABLE_W, Math.min(TABLE_W, b.x));
+  state.cpuX += Math.max(-1, Math.min(1, cpuTarget - state.cpuX)) * 2.4 * dt;
+}
+
+/* ---------------- rendering ---------------- */
+function drawTable() {
+  const corners = [
+    project(-TABLE_W, TABLE_Y, TABLE_NEAR_Z), project(TABLE_W, TABLE_Y, TABLE_NEAR_Z),
+    project(TABLE_W, TABLE_Y, TABLE_FAR_Z),   project(-TABLE_W, TABLE_Y, TABLE_FAR_Z),
+  ];
+  ctx.fillStyle = '#1a3a2e';
+  ctx.beginPath();
+  ctx.moveTo(corners[0].x, corners[0].y);
+  corners.slice(1).forEach(p => ctx.lineTo(p.x, p.y));
+  ctx.closePath(); ctx.fill();
+
+  ctx.strokeStyle = 'rgba(255,255,255,0.55)'; ctx.lineWidth = 2;
+  ctx.stroke();
+  const cl = project(0, TABLE_Y, TABLE_NEAR_Z), cf = project(0, TABLE_Y, TABLE_FAR_Z);
+  ctx.beginPath(); ctx.moveTo(cl.x, cl.y); ctx.lineTo(cf.x, cf.y); ctx.stroke();
+
+  // net
+  const n1 = project(-TABLE_W, TABLE_Y, NET_Z), n2 = project(TABLE_W, TABLE_Y, NET_Z);
+  const n1t = project(-TABLE_W, TABLE_Y + 0.18, NET_Z), n2t = project(TABLE_W, TABLE_Y + 0.18, NET_Z);
+  ctx.fillStyle = 'rgba(230,237,243,0.35)';
+  ctx.beginPath();
+  ctx.moveTo(n1.x, n1.y); ctx.lineTo(n2.x, n2.y); ctx.lineTo(n2t.x, n2t.y); ctx.lineTo(n1t.x, n1t.y);
+  ctx.closePath(); ctx.fill();
+}
+
+function drawPaddle(x, y, z, color, isPlayer) {
+  const p = project(x, y, z);
+  let px = p.x, py = p.y;
+  if (isPlayer) {
+    // Hard guarantee, independent of camera tuning: YOUR paddle is always
+    // somewhere sane on screen. Getting the projection math perfect for
+    // every aspect ratio (phone portrait vs. landscape vs. tablet) is a
+    // moving target; not being able to see your own paddle is not
+    // acceptable at any tuning, so clamp it directly rather than trust the
+    // math alone.
+    px = Math.max(W * 0.08, Math.min(W * 0.92, px));
+    py = Math.max(H * 0.55, Math.min(H * 0.94, py));
+  }
+  const r = Math.max(14, Math.min(46, 26 * p.scale / H * 3));
+  ctx.fillStyle = color;
+  ctx.beginPath(); ctx.ellipse(px, py, r, r * 0.62, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = 'rgba(0,0,0,0.35)'; ctx.lineWidth = 2; ctx.stroke();
+}
+
+// The opponent: a simple stick figure. Torso/head/legs stay put at table
+// center — "standing still" — only the arm reaches out to wherever the
+// paddle (handX) currently is, tracking the ball. On a CPU win it dances
+// instead: a silly, obviously-procedural wiggle, not a real animation rig.
+function drawOpponent(handX, t, dancing) {
+  const standX = 0;
+  const bodyZ = CPU_Z + 0.12;
+  const wiggle = dancing ? Math.sin(t * 9) : 0;
+  const bob = dancing ? Math.abs(Math.sin(t * 9)) * 0.12 : 0;
+  const headY = 1.05 + bob, hipY = 0.55 + bob * 0.6;
+
+  // Everything on ONE depth plane (bodyZ) — like a paper cutout facing the
+  // camera. Mixing depths between the shoulder and the reaching hand (an
+  // earlier version put the hand at CPU_Z, closer to camera than the rest of
+  // the body) makes the two ends of the same line project at different
+  // scales, which is exactly what read as "the arm is separate from the
+  // body". One plane means the arm can never visually detach from its own
+  // shoulder, at the cost of not literally reaching toward the ball's true
+  // depth — a fair trade for a cosmetic stick figure.
+  const head = project(standX + wiggle * 0.06, headY, bodyZ);
+  const hip = project(standX, hipY, bodyZ);
+  const footL = project(standX - (dancing ? 0.18 + wiggle * 0.1 : 0.12), TABLE_Y, bodyZ);
+  const footR = project(standX + (dancing ? 0.18 - wiggle * 0.1 : 0.12), TABLE_Y, bodyZ);
+  const shoulder = project(standX, 0.85 + bob, bodyZ);
+  const offShoulder = project(standX - 0.12, 0.85 + bob, bodyZ);
+
+  // World-space hand position, used both for the arm line and the racket
+  // itself, so they always agree on where the "hand" actually is.
+  const handWx = dancing ? standX + Math.sin(t * 9 + 1.5) * 0.4 : handX;
+  const handWy = dancing ? 1.0 + Math.abs(Math.sin(t * 9 + 1.5)) * 0.3 : 0.55;
+  const handWz = bodyZ;
+  const hand = project(handWx, handWy, handWz);
+  const offHand = dancing
+    ? project(standX - Math.sin(t * 9 + 1.5) * 0.4, 1.0 + Math.abs(Math.sin(t * 9)) * 0.3, bodyZ)
+    : project(standX - 0.18, 0.55, bodyZ);
+
+  ctx.strokeStyle = '#e6edf3'; ctx.lineWidth = 4; ctx.lineCap = 'round';
+  ctx.beginPath(); ctx.moveTo(shoulder.x, shoulder.y); ctx.lineTo(hip.x, hip.y); ctx.stroke();      // torso
+  ctx.beginPath(); ctx.moveTo(hip.x, hip.y); ctx.lineTo(footL.x, footL.y); ctx.stroke();            // left leg
+  ctx.beginPath(); ctx.moveTo(hip.x, hip.y); ctx.lineTo(footR.x, footR.y); ctx.stroke();            // right leg
+  ctx.strokeStyle = '#ff6b6b';
+  ctx.beginPath(); ctx.moveTo(shoulder.x, shoulder.y); ctx.lineTo(hand.x, hand.y); ctx.stroke();     // paddle arm
+  ctx.beginPath(); ctx.moveTo(offShoulder.x, offShoulder.y); ctx.lineTo(offHand.x, offHand.y); ctx.stroke(); // other arm
+
+  const headR = Math.max(10, 16 * head.scale / H * 3);
+  ctx.fillStyle = '#ffcc99';
+  ctx.beginPath(); ctx.arc(head.x, head.y, headR, 0, Math.PI * 2); ctx.fill();
+  if (dancing) {
+    // a little grin — purely cosmetic, purely silly
+    ctx.strokeStyle = '#663300'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(head.x, head.y + headR * 0.15, headR * 0.5, 0.15 * Math.PI, 0.85 * Math.PI); ctx.stroke();
+  }
+
+  drawPaddle(handWx, handWy, handWz, '#ff6b6b', false);
+}
+
+function drawBall() {
+  const b = state.ball;
+  const p = project(b.x, b.y, b.z);
+  const r = Math.max(3, 10 * p.scale / H * 3);
+  // shadow on the table
+  const shadow = project(b.x, TABLE_Y, b.z);
+  ctx.fillStyle = 'rgba(0,0,0,0.35)';
+  ctx.beginPath(); ctx.ellipse(shadow.x, shadow.y, r * 0.9, r * 0.35, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#ffd43b';
+  ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2); ctx.fill();
+}
+
+function render(animT) {
+  ctx.clearRect(0, 0, W, H);
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, '#0a0e14'); g.addColorStop(1, '#111826');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+
+  drawTable();
+  drawOpponent(state.cpuX, animT, state.dancing);
+  if (state.ball.active) drawBall();
+  drawPaddle(state.paddleX, state.paddleY, PADDLE_Z, '#4dabf7', true);
+}
+
+/* ---------------- input: live telemetry over WebSocket ---------------- */
+// Same 20-byte binary protocol as tools/scope.html — see docs/PROTOCOL.md.
+let ws = null, connected = false, zeroRoll = 0, zeroPitch = 0, calibratedOnce = false;
+let liveRoll = 0, livePitch = 0;
+let swingActive = false, swingPeakDps = 0;
+
+// Raised from an earlier 28: with the physical mount changing (breadboard ->
+// real bat), overall tilt behavior will shift, and a wider degrees-to-full-
+// travel range reads as "calmer" without sacrificing reach. Smoothing (below)
+// separately kills frame-to-frame jitter — the two are different problems
+// (gain vs. noise) and both were contributing to "too sensitive".
+const MAX_TILT_DEG = 36;
+// Raised from 0.30: that read as outright lag. This is single-axis-only
+// control now (see below), which has headroom to be closer to raw input
+// without feeling twitchy — most perceived "sensitivity" was two axes of
+// noise compounding, not the filter itself.
+const PADDLE_SMOOTHING = 0.55;
+let smoothNx = 0;
+
+// Axis swap/invert: which physical axis drives left-right depends on how the
+// sensor is mounted, which is about to change (breadboard -> real paddle).
+// Rather than guess and reflash, these are client-side toggles you can flip
+// live and that persist across reloads. Only X matters now — paddle height
+// is fixed, single-axis control per the current design.
+function loadBool(key, def) { const v = localStorage.getItem(key); return v === null ? def : v === '1'; }
+let swapAxes = loadBool('airtt_swapAxes', false);
+let invertX  = loadBool('airtt_invertX', false);
+function syncToggleUI() {
+  document.getElementById('swapAxes').classList.toggle('on', swapAxes);
+  document.getElementById('invertX').classList.toggle('on', invertX);
+}
+document.getElementById('swapAxes').onclick = () => { swapAxes = !swapAxes; localStorage.setItem('airtt_swapAxes', swapAxes ? '1' : '0'); syncToggleUI(); };
+document.getElementById('invertX').onclick  = () => { invertX  = !invertX;  localStorage.setItem('airtt_invertX',  invertX  ? '1' : '0'); syncToggleUI(); };
+syncToggleUI();
+
+function connect() {
+  const url = `ws://${location.hostname}/ws`;
+  ws = new WebSocket(url);
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => { connected = true; setStatus(true); };
+  ws.onclose = () => { connected = false; setStatus(false); setTimeout(connect, 1000); };
+  ws.onerror = () => {};
+  ws.onmessage = ev => {
+    if (!(ev.data instanceof ArrayBuffer)) return;
+    const d = new DataView(ev.data);
+    if (d.byteLength < 20 || d.getUint8(0) !== 0xA7) return;
+    liveRoll = d.getInt16(8, true) / 100;
+    livePitch = d.getInt16(10, true) / 100;
+    swingActive = !!(d.getUint8(1) & 0x01);
+    swingPeakDps = d.getInt16(18, true) / 10;
+  };
+}
+function setStatus(on) {
+  document.getElementById('dot').className = on ? 'live' : '';
+  document.getElementById('statusText').textContent = on ? 'paddle live' : 'reconnecting…';
+}
+function sendRezero() { if (ws && ws.readyState === WebSocket.OPEN) ws.send(new Uint8Array([0x02])); }
+
+document.getElementById('rezero').onclick = sendRezero;
+addEventListener('click', () => { if (state.paused) { hideMsg(); state.dancing = false; state.scoreYou = state.scoreCpu = 0;
+  document.getElementById('scoreYou').textContent = 0; document.getElementById('scoreCpu').textContent = 0;
+  serve('you'); } }, { passive: true });
+
+/* ---------------- main loop ---------------- */
+let lastT = performance.now();
+function frame(now) {
+  const dt = Math.min((now - lastT) / 1000, 0.05);
+  lastT = now;
+
+  // Single axis only: whichever of roll/pitch actually drives left-right
+  // depends on the mount, hence the swap/invert toggles rather than a
+  // reflash. Paddle height is fixed — see state.paddleY above.
+  let rollUse = swapAxes ? livePitch : liveRoll;
+  if (invertX) rollUse = -rollUse;
+
+  const targetNx = Math.max(-1, Math.min(1, rollUse / MAX_TILT_DEG));
+  // Light smoothing on top of the firmware's own complementary filter — that
+  // filter removes drift and swing-corruption, not the small frame-to-frame
+  // jitter that reads as "twitchy" when it's driving a screen paddle directly.
+  smoothNx += (targetNx - smoothNx) * PADDLE_SMOOTHING;
+  state.paddleX = smoothNx * TABLE_W * 0.95;
+
+  step(dt);
+  render(now / 1000);
+  document.getElementById('scoreYou').textContent = state.scoreYou;
+  document.getElementById('scoreCpu').textContent = state.scoreCpu;
+  requestAnimationFrame(frame);
+}
+
+connect();
+showMsg('Air TT', 'Tap anywhere to serve');
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
+
+)AIRTTGAME";
