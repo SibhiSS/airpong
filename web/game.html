@@ -109,6 +109,18 @@ const state = {
 // First to this many points wins.
 const WIN_SCORE = 5;
 
+// How often the opponent lets a ball go — the main difficulty dial, kept in
+// one place because it was previously duplicated at the serve and at the
+// player's return and could drift apart. Raise BASE to make the CPU easier,
+// lower it to make it tougher.
+const CPU_MISS_BASE = 0.15;   // chance at the start of a rally
+const CPU_MISS_RAMP = 0.04;   // extra chance per unit of rally speed gained
+const CPU_MISS_MAX  = 0.30;   // never a total pushover, even in a long rally
+function cpuMissChance() {
+  return Math.min(CPU_MISS_MAX,
+                  CPU_MISS_BASE + Math.max(0, state.rallySpeed - 1.6) * CPU_MISS_RAMP);
+}
+
 const GRAVITY = -3.4;
 const TABLE_Y = 0.0;
 const RESTITUTION = 0.68;
@@ -137,9 +149,7 @@ function serve(who) {
   state.cpuHandled = (who === 'cpu');
   // A serve from you is a ball the opponent has to receive, so it needs the
   // same up-front decision a returned ball gets.
-  state.cpuWillMiss = (who === 'you')
-    ? Math.random() < Math.min(0.55, 0.28 + Math.max(0, state.rallySpeed - 1.6) * 0.06)
-    : false;
+  state.cpuWillMiss = (who === 'you') ? Math.random() < cpuMissChance() : false;
   b.active = true;
   state.paused = false;
 }
@@ -243,8 +253,7 @@ function step(dt) {
       // opponent then stops tracking for this shot, so a miss looks like it
       // let the ball go rather than the ball passing through a bat that was
       // sitting right on it.
-      const missChance = Math.min(0.55, 0.28 + Math.max(0, state.rallySpeed - 1.6) * 0.06);
-      state.cpuWillMiss = Math.random() < missChance;
+      state.cpuWillMiss = Math.random() < cpuMissChance();
     }
   }
   // Missed it entirely, ball keeps going past you.
@@ -432,7 +441,7 @@ const MAX_TILT_DEG = 36;
 // control now (see below), which has headroom to be closer to raw input
 // without feeling twitchy — most perceived "sensitivity" was two axes of
 // noise compounding, not the filter itself.
-const PADDLE_SMOOTHING = 0.85;
+const PADDLE_SMOOTHING = 0.70;
 let smoothNx = 0;
 
 // Axis swap/invert: which physical axis drives left-right depends on how the
