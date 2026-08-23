@@ -108,11 +108,19 @@ void netInit() {
   // Serving these pages itself, rather than pointing a phone at a file on
   // the dev PC, is what actually makes this work off the PC entirely: join
   // the AP, browse to this IP, done. No file path, no second network.
+  // no-cache: these pages change every reflash during active development,
+  // and a phone browser caching a stale one — then a fix "not working" when
+  // it actually already shipped — is exactly the confusion that cost real
+  // time earlier. Correctness here matters more than the bandwidth saved.
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *req) {
-    req->send_P(200, "text/html", GAME_HTML);
+    AsyncWebServerResponse *res = req->beginResponse_P(200, "text/html", GAME_HTML);
+    res->addHeader("Cache-Control", "no-store");
+    req->send(res);
   });
   server.on("/scope", HTTP_GET, [](AsyncWebServerRequest *req) {
-    req->send_P(200, "text/html", SCOPE_HTML);
+    AsyncWebServerResponse *res = req->beginResponse_P(200, "text/html", SCOPE_HTML);
+    res->addHeader("Cache-Control", "no-store");
+    req->send(res);
   });
   server.begin();
   Serial.println("HTTP+WS server started on port 80");
