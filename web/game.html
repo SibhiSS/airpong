@@ -103,8 +103,11 @@ const state = {
   serving: 'you',
   paused: true,
   dancing: false,
-  playerHandled: false, cpuHandled: false,
+  playerHandled: false, cpuHandled: false, cpuWillMiss: false,
 }
+
+// First to this many points wins.
+const WIN_SCORE = 5;
 
 const GRAVITY = -3.4;
 const TABLE_Y = 0.0;
@@ -132,6 +135,11 @@ function serve(who) {
   // enforce that (see the CPU contact zone in step() for why).
   state.playerHandled = (who === 'you');
   state.cpuHandled = (who === 'cpu');
+  // A serve from you is a ball the opponent has to receive, so it needs the
+  // same up-front decision a returned ball gets.
+  state.cpuWillMiss = (who === 'you')
+    ? Math.random() < Math.min(0.55, 0.28 + Math.max(0, state.rallySpeed - 1.6) * 0.06)
+    : false;
   b.active = true;
   state.paused = false;
 }
@@ -145,7 +153,7 @@ function endGame() {
 
 function pointTo(who) {
   if (who === 'you') state.scoreYou++; else state.scoreCpu++;
-  if (state.scoreYou >= 11 || state.scoreCpu >= 11) { endGame(); return; }
+  if (state.scoreYou >= WIN_SCORE || state.scoreCpu >= WIN_SCORE) { endGame(); return; }
   state.ball.active = false;
   state.rallySpeed = 1.6;
   setTimeout(() => serve(who === 'you' ? 'you' : 'cpu'), 700);
@@ -194,7 +202,6 @@ function step(dt) {
   if (state.paused || !state.ball.active) return;
   const b = state.ball;
 
-  const prevZ = b.z;
   b.vy += GRAVITY * dt;
   b.x += b.vx * dt; b.y += b.vy * dt; b.z += b.vz * dt;
 
@@ -214,13 +221,10 @@ function step(dt) {
     b.vy *= -RESTITUTION;
   }
 
-  // Net. Tested as a CROSSING (prevZ vs z), not "is z within 0.03 of the
-  // net" — at rally speed the ball moves far more than 0.03 per frame and
-  // would tunnel straight through a thin band without ever registering.
-  if ((prevZ - NET_Z) * (b.z - NET_Z) <= 0 && b.y < 0.14) {
-    b.z = prevZ;
-    b.vz *= -0.3; b.vx *= 0.5;
-  }
+  // The net is drawn but is deliberately NOT a collider. With a single-axis
+  // paddle you have no control over shot height, so a net that blocks low
+  // balls punishes you for something you cannot aim — it read as unavoidable
+  // rather than as a skill check.
 
   // Player contact zone (near baseline, moving toward you). Single-axis
   // arcade deflect: no swing required, no Y check — close enough in X and
@@ -235,6 +239,12 @@ function step(dt) {
       reflect(b, +1, dx, state.rallySpeed);
       b.z = PADDLE_Z + 0.07;
       state.cpuHandled = false;      // arm the CPU's single attempt
+      // Decide NOW, at the moment you return the ball, not on contact. The
+      // opponent then stops tracking for this shot, so a miss looks like it
+      // let the ball go rather than the ball passing through a bat that was
+      // sitting right on it.
+      const missChance = Math.min(0.55, 0.28 + Math.max(0, state.rallySpeed - 1.6) * 0.06);
+      state.cpuWillMiss = Math.random() < missChance;
     }
   }
   // Missed it entirely, ball keeps going past you.
@@ -247,8 +257,7 @@ function step(dt) {
   // opponent that literally never lost a point. Decide ONCE per approach.
   if (b.z >= CPU_Z - 0.06 && b.vz > 0 && !state.cpuHandled) {
     state.cpuHandled = true;
-    const missChance = Math.min(0.55, 0.28 + Math.max(0, state.rallySpeed - 1.6) * 0.06);
-    if (Math.random() > missChance) {
+    if (!state.cpuWillMiss) {
       reflect(b, -1, b.x - state.cpuX, state.rallySpeed);
       b.z = CPU_Z - 0.07;
       state.playerHandled = false;   // arm the player's single attempt
@@ -257,8 +266,14 @@ function step(dt) {
   if (b.z > CPU_Z + 0.35) { pointTo('you'); return; }
 
   // CPU paddle tracks the ball's x with a speed cap — imperfect, not psychic.
-  const cpuTarget = Math.max(-TABLE_W, Math.min(TABLE_W, b.x));
-  state.cpuX += Math.max(-1, Math.min(1, cpuTarget - state.cpuX)) * 2.4 * dt;
+  // When it has already decided to let this one go, it stops chasing and
+  // eases back to centre, so the miss is visible as a choice.
+  if (state.cpuWillMiss && b.vz > 0) {
+    state.cpuX += (0 - state.cpuX) * 1.2 * dt;
+  } else {
+    const cpuTarget = Math.max(-TABLE_W, Math.min(TABLE_W, b.x));
+    state.cpuX += Math.max(-1, Math.min(1, cpuTarget - state.cpuX)) * 2.4 * dt;
+  }
 }
 
 /* ---------------- rendering ---------------- */
@@ -417,7 +432,7 @@ const MAX_TILT_DEG = 36;
 // control now (see below), which has headroom to be closer to raw input
 // without feeling twitchy — most perceived "sensitivity" was two axes of
 // noise compounding, not the filter itself.
-const PADDLE_SMOOTHING = 0.55;
+const PADDLE_SMOOTHING = 0.85;
 let smoothNx = 0;
 
 // Axis swap/invert: which physical axis drives left-right depends on how the
