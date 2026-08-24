@@ -22,7 +22,42 @@ device with no garbage collector, for a payload that is two numbers. A fixed
 
 `wx/wy/wz` ride along specifically so the client can dead-reckon the paddle
 forward by the measured round-trip latency instead of rendering whatever
-orientation happened to arrive last (PLAN.md section 4).
+orientation happened to arrive last (PLAN.md section 4). `web/game.html` does
+exactly that: it projects roll/pitch forward by `rtt/2 + (age of the newest
+frame)`, clamped, and freezes rather than extrapolating once a frame is more
+than 300 ms old.
+
+**Frames are dropped, never queued.** The firmware only emits a telemetry frame
+if the WebSocket send queue is empty (`net.cpp`, `availableForWriteAll`). On a
+link too weak to carry 100 Hz, the alternative is that frames pile up in the TCP
+send queue — and because WebSocket runs over TCP, the client cannot skip to the
+newest one, it must be handed every stale frame first. That is what turns a weak
+link into a *growing* lag rather than a merely slow one. Dropping instead means
+the stream degrades in rate (down to ~30 Hz, config.h `SEND_INTERVAL_CEILING_MS`)
+while every frame that does arrive is current. A client that cares can see the
+drops in the `seq` gaps and in the stat frame below.
+
+## Server → client: link stats (14 bytes, ~2 Hz)
+
+Distinguished from telemetry by its first byte: telemetry starts `0xA7`, this
+starts `0x04`, a ping reply starts `0x01`. A client that only wants orientation
+can ignore anything whose first byte is not `0xA7`, exactly as before.
+
+| offset | size | field | meaning |
+|---|---|---|---|
+| 0 | 1 | opcode | always `0x04` (`OP_STAT`) |
+| 1 | 1 | clients | `u8`, connected WebSocket clients |
+| 2 | 1 | rssi | `i8` dBm the AP sees from the associated station, or 0 if none. This is the *phone's* signal arriving at the paddle — the direction that actually degrades outdoors, and the one a phone's own WiFi readout cannot show you. |
+| 3 | 1 | txHz | `u8`, telemetry frames actually sent over the last window — below the nominal 100 whenever frames are being dropped |
+| 4 | 2 | dropped | `u16`, frames dropped to backpressure since boot, wraps |
+| 6 | 2 | imuTemp | `i16`, deci-degrees C of the MPU die |
+| 8 | 4 | freeHeap | `u32` bytes |
+| 12 | 2 | intervalMs | `u16`, the send interval currently in use — above `SEND_INTERVAL_MS_DEFAULT` means the rate has backed off |
+
+Together these separate the three faults that feel identical from the player's
+side: a weak radio link (`rssi` low), a queue backing up (`dropped` climbing,
+`txHz` under 100), and a phone throttling its own rendering (both of those fine,
+`fps` in the game's own readout low).
 
 **Why swingPeak is continuous, not an event:** waiting for a swing to finish
 before reporting it means reporting it after the moment the ball needed
@@ -43,7 +78,10 @@ rather than shipped as a number that quietly rots.
 |---|---|---|
 | `0x01` PING | 4 bytes: client's own `u32` timestamp (any units, any epoch) | Server replies with `0x01` + the same 4 bytes echoed + its own `u32 millis()` (9 bytes total). The client never needs clock sync with the ESP32 — it just measures its own timestamp before send and after reply and takes the difference for RTT. |
 | `0x02` REZERO | none | The next transmitted roll/pitch become `(0, 0)`. Recentering happens on the device so every client — the scope, the game, anything else — gets "tilt from wherever you're holding it now" for free, instead of each reimplementing it. |
-| `0x03` SETRATE | 1 byte: desired rate in Hz | Clamped to 10–200 Hz server-side. Changes how often telemetry is sent; sampling stays fixed at 200 Hz regardless. |
+| `0x03` SETRATE | 1 byte: desired rate in Hz | Clamped to 10–200 Hz server-side. Sets the *requested* rate; the firmware may still send slower than this when the link cannot keep up, and returns to it when the link recovers. Sampling stays fixed at 200 Hz regardless. |
+
+`0x04` is reserved for the server→client stat frame above and is not a valid
+client→server opcode.
 
 ## Why sampling and sending are different rates
 

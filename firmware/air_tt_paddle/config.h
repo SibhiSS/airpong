@@ -48,6 +48,51 @@ static const uint16_t SEND_INTERVAL_MS_MAX = 100;    // 10 Hz floor
 #define STA_PASSWORD     ""
 #define STA_CONNECT_TIMEOUT_MS 8000
 
+// Indoors, a small room is the best possible RF environment: the tablet is a
+// couple of metres away and every wall bounces a second copy of the signal
+// around your body. Outdoors there are no reflections at all, so the only path
+// left is the direct one — and that path runs through the arm and torso of the
+// person holding the paddle, which costs 10-20 dB at 2.4 GHz. Same hardware,
+// far worse link. Everything below is about not making that worse than it has
+// to be.
+//
+// Channel is pinned rather than left at the default so it can be moved off a
+// busy one without hunting through the API; 1 / 6 / 11 are the only
+// non-overlapping choices.
+#define AP_CHANNEL       1
+// Bounded so a phone that walks out of range and silently dies does not sit in
+// the client list burning airtime on retransmits while its replacement
+// connects. The game needs exactly one screen; the spare slot is for having
+// /scope open alongside it.
+#define WS_MAX_CLIENTS   2
+
+// ---------------- link backpressure ----------------
+// The failure this exists to prevent: telemetry was previously broadcast every
+// SEND_INTERVAL_MS regardless of whether the last frame had actually left the
+// device. That is fine on a strong link, where the queue drains faster than it
+// fills. On a weak one it is a latency pump — frames pile up in the TCP send
+// queue, and because WebSocket runs over TCP the client cannot skip ahead to
+// the newest one, it has to be handed every stale frame first. The paddle then
+// renders where your hand was a second ago and the lag grows the longer you
+// play. That is a queue, not a slow link, and no amount of signal fixes it.
+//
+// The rule instead: never queue an orientation behind an older one. If the
+// previous frame has not drained, drop this one — the next sample supersedes it
+// anyway. Latency then stays bounded no matter how bad the link gets, and the
+// stream degrades in update rate instead, which the client's extrapolation is
+// there to cover.
+static const uint8_t  BACKPRESSURE_SKIPS_BEFORE_BACKOFF = 8;
+static const uint16_t SEND_INTERVAL_BACKOFF_MS = 5;    // added per backoff step
+static const uint16_t SEND_INTERVAL_CEILING_MS = 33;   // ~30 Hz, the slowest we go
+static const uint32_t SEND_RATE_RECOVER_MS = 2000;     // clean for this long => speed back up
+
+// ---------------- link diagnostics ----------------
+// Sent alongside telemetry so "it lags outside" can be resolved on the field
+// instead of guessed at afterwards: RSSI separates a weak link from a busy one,
+// the drop counter separates a weak link from a queue, and the IMU temperature
+// separates both from the sensor cooking in the sun.
+static const uint16_t STAT_INTERVAL_MS = 500;
+
 // ---------------- drift correction ----------------
 // A MEMS gyro's zero-rate output is never exactly zero and moves as the part
 // warms up, so the one-shot calibration at boot goes stale within minutes.
@@ -66,6 +111,35 @@ static const float STILL_ACC_TOL  = 0.08f;   // |a| within this of 1g => not acc
 static const uint32_t STILL_MS_BEFORE_RECENTRE = 1200;
 static const float GYRO_BIAS_TRACK = 0.0020f;  // per-sample, ~2.5s time constant at 200Hz
 static const float AUTO_ZERO_RATE  = 0.0015f;  // per-sample, ~3.3s time constant at 200Hz
+
+// The deadlock the above has on its own, and why sunlight is what triggers it:
+// a MEMS gyro's zero-rate output moves with die temperature, and a paddle left
+// in direct sun goes from a ~25 C room to 50-60 C in minutes. Once that shift
+// pushes the bias-corrected rate past STILL_GYRO_DPS, the paddle *never* reads
+// as still again — so the bias tracker that exists precisely to correct that
+// shift stops running, and the error it would have removed is now permanent.
+// It cannot recover on its own. The one-shot boot calibration is also, by
+// then, a measurement of a completely different sensor temperature.
+//
+// The way out is a rest detector that does not consult the gyro at all: if
+// gravity's direction has not moved, the paddle is not rotating, whatever the
+// gyro claims. Trusting that lets the bias tracker run again and unwind the
+// offset. It runs slower than the normal path because the accelerometer cannot
+// see rotation about the gravity axis, so a long steady yaw would slowly be
+// absorbed as bias — harmless here (yaw is deliberately unused, see
+// docs/PROTOCOL.md) but worth not doing quickly.
+static const float ACC_REST_FAST    = 0.10f;   // fast EMA on the accel-derived angle
+static const float ACC_REST_TRACK   = 0.01f;   // ... and the slow one it is compared against
+static const float ACC_REST_TOL_DEG = 1.5f;    // fast and slow within this => not rotating
+static const float GYRO_BIAS_RECOVER = 0.0004f;  // ~12s time constant at 200Hz
+
+// ---------------- thermal ----------------
+// The MPU-6050's temperature register was already being read as part of the
+// 14-byte burst and thrown away. It costs nothing to keep, and it is the
+// difference between "the paddle drifts outdoors" and "the paddle is at 54 C,
+// 29 C above where it was calibrated, of course it drifts".
+static const float TEMP_DRIFT_WARN_C = 8.0f;     // warn once past this much change
+static const uint32_t TEMP_WARN_INTERVAL_MS = 30000;
 
 // ---------------- swing detection ----------------
 // Phase 0 measured ~2 dps at rest and 869 dps peak on a hard real swing —
@@ -88,3 +162,4 @@ static const uint8_t FLAG_BUTTON       = 1 << 3;
 static const uint8_t OP_PING    = 0x01;
 static const uint8_t OP_REZERO  = 0x02;
 static const uint8_t OP_SETRATE = 0x03;
+static const uint8_t OP_STAT    = 0x04;   // server -> client only, see docs/PROTOCOL.md

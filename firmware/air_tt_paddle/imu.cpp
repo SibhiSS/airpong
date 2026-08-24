@@ -24,6 +24,19 @@ static uint32_t lastUpdateUs = 0;
 static bool firstSample = true;
 static uint32_t stillSinceMs = 0;   // 0 = currently moving
 
+// Accelerometer-only rest detection, which is what breaks the thermal deadlock
+// described in config.h. Two averages of the gravity-derived angle rather than
+// one: a fast one that tracks where the paddle is now, and a slow one that
+// tracks where it has been. Comparing the two answers "is it rotating?" while
+// comparing a raw sample against an average would mostly have answered "is the
+// accelerometer noisy?" — at ~0.6 deg RMS of sample noise against a 1.5 deg
+// threshold, that is a couple of false trips a second, each one resetting the
+// stillness timer that the auto-recentre needs 1.2 s of.
+
+static float tempC = 0;             // die temperature, updated every sample
+static float calibTempC = 0;        // ... and what it was when calibrate() ran
+static uint32_t lastTempWarnMs = 0;
+
 static bool wr(uint8_t reg, uint8_t val) {
   Wire.beginTransmission(mpuAddr);
   Wire.write(reg);
@@ -48,7 +61,8 @@ static bool rd(uint8_t reg, uint8_t *buf, size_t n) {
 static void calibrate() {
   Serial.println("--- IMU calibration: hold the paddle stationary and flat ---");
   const int N = 300;
-  long sax = 0, say = 0, saz = 0, sgx = 0, sgy = 0, sgz = 0;
+  long sax = 0, say = 0, saz = 0, sgx = 0, sgy = 0, sgz = 0, st = 0;
+  int got = 0;
 
   for (int i = 0; i < N; i++) {
     uint8_t b[14];
@@ -56,9 +70,11 @@ static void calibrate() {
       sax += (int16_t)(b[0] << 8 | b[1]);
       say += (int16_t)(b[2] << 8 | b[3]);
       saz += (int16_t)(b[4] << 8 | b[5]);
+      st  += (int16_t)(b[6] << 8 | b[7]);
       sgx += (int16_t)(b[8] << 8 | b[9]);
       sgy += (int16_t)(b[10] << 8 | b[11]);
       sgz += (int16_t)(b[12] << 8 | b[13]);
+      got++;
     }
     delay(3);
   }
@@ -71,8 +87,16 @@ static void calibrate() {
   offGy = (sgy / (float)N) / GYRO_LSB_PER_DPS;
   offGz = (sgz / (float)N) / GYRO_LSB_PER_DPS;
 
-  Serial.printf("calibration done. accel off (g): %.3f,%.3f,%.3f  gyro bias (dps): %.2f,%.2f,%.2f\n",
-                offAx, offAy, offAz, offGx, offGy, offGz);
+  // These offsets are only valid at the temperature they were measured at, so
+  // record it. Everything downstream that wonders whether the calibration has
+  // gone stale can then compare against a number instead of guessing.
+  calibTempC = got ? ((st / (float)got) / 340.0f + 36.53f) : 0.0f;
+  tempC = calibTempC;
+
+  Serial.printf("calibration done. accel off (g): %.3f,%.3f,%.3f  gyro bias (dps): %.2f,%.2f,%.2f  @ %.1f C\n",
+                offAx, offAy, offAz, offGx, offGy, offGz, calibTempC);
+  Serial.println("   (calibrate in the shade if you are about to play in the sun — "
+                 "these offsets move with die temperature.)");
 }
 
 bool imuInit() {
@@ -110,6 +134,8 @@ bool imuInit() {
   lastUpdateUs = micros();
   firstSample = true;
   stillSinceMs = 0;
+  accAvgSeeded = false;
+  lastTempWarnMs = 0;
   return true;
 }
 
@@ -130,12 +156,14 @@ ImuSample imuUpdate() {
     s.fault = true;
     s.roll_deg = rollF - zeroRoll;
     s.pitch_deg = pitchF - zeroPitch;
+    s.temp_c = tempC;      // last known good, so the stat frame stays readable
     return s;
   }
 
   int16_t rax = (int16_t)(b[0] << 8 | b[1]);
   int16_t ray = (int16_t)(b[2] << 8 | b[3]);
   int16_t raz = (int16_t)(b[4] << 8 | b[5]);
+  int16_t rt  = (int16_t)(b[6] << 8 | b[7]);
   int16_t rgx = (int16_t)(b[8] << 8 | b[9]);
   int16_t rgy = (int16_t)(b[10] << 8 | b[11]);
   int16_t rgz = (int16_t)(b[12] << 8 | b[13]);
@@ -146,6 +174,19 @@ ImuSample imuUpdate() {
   float gx = rgx / GYRO_LSB_PER_DPS - offGx;
   float gy = rgy / GYRO_LSB_PER_DPS - offGy;
   float gz = rgz / GYRO_LSB_PER_DPS - offGz;
+
+  // Datasheet conversion. Reported rather than compensated for: a per-part
+  // temperature coefficient would have to be measured per sensor, whereas the
+  // continuous bias tracking below removes the drift without needing to know
+  // where it came from. The number is here so it is possible to tell that
+  // story apart from a network problem when both look like "it lags outside".
+  tempC = rt / 340.0f + 36.53f;
+  if (calibrated && fabsf(tempC - calibTempC) > TEMP_DRIFT_WARN_C &&
+      millis() - lastTempWarnMs > TEMP_WARN_INTERVAL_MS) {
+    lastTempWarnMs = millis();
+    Serial.printf("!! IMU at %.1f C, %.1f C from calibration (%.1f C) — re-zero if aim has walked\n",
+                  tempC, tempC - calibTempC, calibTempC);
+  }
 
   // Accelerometer-only estimate: correct at rest, meaningless mid-swing once
   // linear acceleration swamps gravity. This is exactly what the reference
@@ -174,10 +215,28 @@ ImuSample imuUpdate() {
   // to one side as the gyro's zero-rate output wanders, and the paddle ends up
   // parked off-centre so one side of the table becomes hard to reach.
   const float aMag = sqrtf(ax * ax + ay * ay + az * az);
-  const bool still = fabsf(gx) < STILL_GYRO_DPS &&
+
+  // A rest test the gyro gets no vote in. Gravity's measured direction only
+  // moves if the paddle actually rotates, so an accel-derived angle that has
+  // not budged from its own slow average means "not rotating" — a statement
+  // that stays true no matter how far the gyro's zero has wandered.
+  if (!accAvgSeeded) {
+    accRollFast = accRollSlow = rollAcc;
+    accPitchFast = accPitchSlow = pitchAcc;
+    accAvgSeeded = true;
+  }
+  accRollFast  += (rollAcc  - accRollFast)  * ACC_REST_FAST;
+  accPitchFast += (pitchAcc - accPitchFast) * ACC_REST_FAST;
+  accRollSlow  += (rollAcc  - accRollSlow)  * ACC_REST_TRACK;
+  accPitchSlow += (pitchAcc - accPitchSlow) * ACC_REST_TRACK;
+  const bool accAtRest = fabsf(aMag - 1.0f) < STILL_ACC_TOL &&
+                         fabsf(accRollFast  - accRollSlow)  < ACC_REST_TOL_DEG &&
+                         fabsf(accPitchFast - accPitchSlow) < ACC_REST_TOL_DEG;
+
+  const bool still = accAtRest &&
+                     fabsf(gx) < STILL_GYRO_DPS &&
                      fabsf(gy) < STILL_GYRO_DPS &&
-                     fabsf(gz) < STILL_GYRO_DPS &&
-                     fabsf(aMag - 1.0f) < STILL_ACC_TOL;
+                     fabsf(gz) < STILL_GYRO_DPS;
 
   if (still) {
     // gx/gy/gz are already bias-corrected, so nudging the stored offset by a
@@ -192,15 +251,28 @@ ImuSample imuUpdate() {
       zeroPitch += (pitchF - zeroPitch) * AUTO_ZERO_RATE;
     }
   } else {
+    if (accAtRest) {
+      // Gravity says stationary, the gyro says otherwise: the gyro is wrong,
+      // and the amount it is wrong by is exactly the bias to remove. This is
+      // the branch that recovers from a thermal shift large enough to have
+      // locked the branch above out of ever running again (see config.h).
+      offGx += gx * GYRO_BIAS_RECOVER;
+      offGy += gy * GYRO_BIAS_RECOVER;
+      offGz += gz * GYRO_BIAS_RECOVER;
+    }
     stillSinceMs = 0;
   }
 
   s.roll_deg  = rollF  - zeroRoll;
   s.pitch_deg = pitchF - zeroPitch;
   s.wx_dps = gx; s.wy_dps = gy; s.wz_dps = gz;
+  s.temp_c = tempC;
   s.fault = false;
   return s;
 }
+
+float imuTempC() { return tempC; }
+float imuCalibTempC() { return calibTempC; }
 
 void imuZero() {
   zeroRoll = rollF;

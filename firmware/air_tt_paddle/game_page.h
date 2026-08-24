@@ -23,7 +23,16 @@ static const char GAME_HTML[] PROGMEM = R"AIRTTGAME(
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <title>Air TT</title>
 <style>
-  :root{ --bg:#0a0e14; --line:#2a323d; --fg:#e6edf3; --dim:#8b949e; --accent:#4dabf7; --miss:#ff6b6b; --ok:#2ed573; }
+  :root{ --bg:#0a0e14; --line:#2a323d; --fg:#e6edf3; --dim:#8b949e; --accent:#4dabf7; --miss:#ff6b6b; --ok:#2ed573;
+         --btn:#21262d; --btnFg:#e6edf3; --btnOnFg:#04121f; }
+  /* Daylight: the dark theme above is unreadable on a phone in direct sun.
+     A phone's screen cannot out-shine the sun, so the only contrast available
+     outdoors is between its brightest possible pixel and its darkest — which
+     means a white background with near-black ink, the opposite of indoors.
+     Toggled at runtime rather than chosen by prefers-color-scheme: the phone
+     has no idea whether it is currently in shade. */
+  body.day{ --bg:#f2f5f8; --line:#9aa5b1; --fg:#05080c; --dim:#3d4650; --accent:#0b4f9e; --miss:#a01020; --ok:#0a6b2c;
+            --btn:#ffffff; --btnFg:#05080c; --btnOnFg:#ffffff; }
   *{box-sizing:border-box; -webkit-tap-highlight-color:transparent}
   html,body{margin:0;height:100%;overflow:hidden;background:var(--bg);
             font:14px/1.4 ui-monospace,"Cascadia Code",Consolas,monospace;color:var(--fg);
@@ -36,14 +45,23 @@ static const char GAME_HTML[] PROGMEM = R"AIRTTGAME(
   #status{display:flex;gap:8px;align-items:center;color:var(--dim)}
   #dot{width:8px;height:8px;border-radius:50%;background:var(--miss)}
   #dot.live{background:var(--ok)}
-  #controls{position:fixed;bottom:14px;right:14px;display:flex;gap:8px;pointer-events:auto}
-  #controls button{padding:10px 14px;border-radius:8px;background:#21262d;
-                    border:1px solid var(--line);color:var(--fg);font:inherit;font-size:12px}
-  #controls button.on{background:var(--accent);border-color:var(--accent);color:#04121f}
+  #controls{position:fixed;bottom:14px;right:14px;display:flex;gap:8px;flex-wrap:wrap;
+            justify-content:flex-end;max-width:70vw;pointer-events:auto}
+  #controls button{padding:10px 14px;border-radius:8px;background:var(--btn);
+                    border:1px solid var(--line);color:var(--btnFg);font:inherit;font-size:12px}
+  #controls button.on{background:var(--accent);border-color:var(--accent);color:var(--btnOnFg)}
   #msg{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);text-align:center;
        display:none;pointer-events:none}
   #msg h1{font-size:28px;margin:0 0 6px}
   #msg p{color:var(--dim);margin:0}
+  /* Link readout. Its whole reason for existing is that "it lags outside" is
+     three different faults that feel identical — a weak radio link, a queue
+     backing up, and a phone throttling its own frame rate — and they are only
+     told apart by numbers taken while it is happening, on the spot. */
+  #diag{position:fixed;bottom:14px;left:14px;display:none;pointer-events:none;
+        font-size:11px;line-height:1.5;color:var(--dim);white-space:pre}
+  #diag.on{display:block}
+  #diag .warn{color:var(--miss)}
 </style>
 </head>
 <body>
@@ -54,10 +72,13 @@ static const char GAME_HTML[] PROGMEM = R"AIRTTGAME(
     <div id="status"><span id="dot"></span><span id="statusText">connecting…</span></div>
   </div>
   <div id="msg"><h1 id="msgTitle"></h1><p id="msgSub"></p></div>
+  <div id="diag"></div>
   <div id="controls">
     <button id="rezero">Re-zero</button>
     <button id="swapAxes">Swap axes</button>
     <button id="invertX">Invert X</button>
+    <button id="daylight">Daylight</button>
+    <button id="stats">Stats</button>
   </div>
 </div>
 
@@ -292,18 +313,56 @@ function step(dt) {
 }
 
 /* ---------------- rendering ---------------- */
+// Two palettes, because the room and the outdoors are genuinely different
+// display problems. Indoors, a dark scene looks good and costs nothing.
+// Outdoors in direct sun, ambient light reflecting off the glass swamps
+// everything the panel emits, and dark pixels are the first thing to
+// disappear — the "night" table reads as a uniform grey slab and the ball
+// reads as nothing at all. Daylight inverts it: the brightest pixel the phone
+// has is white, so the background becomes white and everything drawn on it
+// becomes near-black, with fatter strokes so thin lines survive the glare.
+const THEMES = {
+  night: {
+    skyTop:'#0a0e14', skyBot:'#111826', table:'#1a3a2e',
+    line:'rgba(255,255,255,0.55)', net:'rgba(230,237,243,0.35)',
+    paddle:'#4dabf7', paddleEdge:'rgba(0,0,0,0.35)',
+    ball:'#ffd43b', ballEdge:null, ballShadow:'rgba(0,0,0,0.35)',
+    body:'#e6edf3', skin:'#ffcc99', arm:'#ffb3b3', mouth:'#7a3d00',
+    racket:'#ff6b6b', racketEdge:'rgba(0,0,0,0.4)',
+    strokeScale:1,
+  },
+  day: {
+    skyTop:'#ffffff', skyBot:'#dbe3ec', table:'#0d5c46',
+    line:'rgba(255,255,255,0.95)', net:'rgba(10,14,20,0.55)',
+    paddle:'#0b3d91', paddleEdge:'rgba(0,0,0,0.9)',
+    // A black rim around the ball is what keeps it findable against both the
+    // white sky and the green table without needing a different colour on each.
+    ball:'#ff8800', ballEdge:'#000000', ballShadow:'rgba(0,0,0,0.55)',
+    body:'#05080c', skin:'#8a4b12', arm:'#7a1f1f', mouth:'#05080c',
+    racket:'#a01020', racketEdge:'rgba(0,0,0,0.85)',
+    strokeScale:1.8,
+  },
+};
+let daylight = loadBool('airtt_daylight', false);
+let TH = THEMES[daylight ? 'day' : 'night'];
+function applyTheme() {
+  TH = THEMES[daylight ? 'day' : 'night'];
+  document.body.classList.toggle('day', daylight);
+  document.getElementById('daylight').classList.toggle('on', daylight);
+}
+
 function drawTable() {
   const corners = [
     project(-TABLE_W, TABLE_Y, TABLE_NEAR_Z), project(TABLE_W, TABLE_Y, TABLE_NEAR_Z),
     project(TABLE_W, TABLE_Y, TABLE_FAR_Z),   project(-TABLE_W, TABLE_Y, TABLE_FAR_Z),
   ];
-  ctx.fillStyle = '#1a3a2e';
+  ctx.fillStyle = TH.table;
   ctx.beginPath();
   ctx.moveTo(corners[0].x, corners[0].y);
   corners.slice(1).forEach(p => ctx.lineTo(p.x, p.y));
   ctx.closePath(); ctx.fill();
 
-  ctx.strokeStyle = 'rgba(255,255,255,0.55)'; ctx.lineWidth = 2;
+  ctx.strokeStyle = TH.line; ctx.lineWidth = 2 * TH.strokeScale;
   ctx.stroke();
   const cl = project(0, TABLE_Y, TABLE_NEAR_Z), cf = project(0, TABLE_Y, TABLE_FAR_Z);
   ctx.beginPath(); ctx.moveTo(cl.x, cl.y); ctx.lineTo(cf.x, cf.y); ctx.stroke();
@@ -311,7 +370,7 @@ function drawTable() {
   // net
   const n1 = project(-TABLE_W, TABLE_Y, NET_Z), n2 = project(TABLE_W, TABLE_Y, NET_Z);
   const n1t = project(-TABLE_W, TABLE_Y + 0.18, NET_Z), n2t = project(TABLE_W, TABLE_Y + 0.18, NET_Z);
-  ctx.fillStyle = 'rgba(230,237,243,0.35)';
+  ctx.fillStyle = TH.net;
   ctx.beginPath();
   ctx.moveTo(n1.x, n1.y); ctx.lineTo(n2.x, n2.y); ctx.lineTo(n2t.x, n2t.y); ctx.lineTo(n1t.x, n1t.y);
   ctx.closePath(); ctx.fill();
@@ -333,7 +392,7 @@ function drawPaddle(x, y, z, color, isPlayer) {
   const r = Math.max(14, Math.min(46, 26 * p.scale / H * 3));
   ctx.fillStyle = color;
   ctx.beginPath(); ctx.ellipse(px, py, r, r * 0.62, 0, 0, Math.PI * 2); ctx.fill();
-  ctx.strokeStyle = 'rgba(0,0,0,0.35)'; ctx.lineWidth = 2; ctx.stroke();
+  ctx.strokeStyle = TH.paddleEdge; ctx.lineWidth = 2 * TH.strokeScale; ctx.stroke();
 }
 
 // The opponent: a simple stick figure. Torso/head/legs stay put at table
@@ -378,8 +437,8 @@ function drawOpponent(cpuWorldX, t, dancing) {
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
 
-  ctx.strokeStyle = '#e6edf3';
-  ctx.lineWidth = Math.max(2, u * 0.26);
+  ctx.strokeStyle = TH.body;
+  ctx.lineWidth = Math.max(2, u * 0.26) * TH.strokeScale;
   ctx.beginPath(); ctx.moveTo(cx, shoulderY); ctx.lineTo(cx, hipY); ctx.stroke();          // torso
   ctx.beginPath();                                                                          // legs
   ctx.moveTo(cx, hipY); ctx.lineTo(cx - u * (dancing ? 1.1 : 0.6) + wiggle * u * 0.3, footY);
@@ -387,14 +446,14 @@ function drawOpponent(cpuWorldX, t, dancing) {
   ctx.stroke();
   ctx.beginPath(); ctx.moveTo(cx, shoulderY); ctx.lineTo(offX, offY); ctx.stroke();         // off arm
 
-  ctx.strokeStyle = '#ffb3b3';                                                              // playing arm
+  ctx.strokeStyle = TH.arm;                                                                 // playing arm
   ctx.beginPath(); ctx.moveTo(cx, shoulderY); ctx.lineTo(handScreenX, handScreenY); ctx.stroke();
 
-  ctx.fillStyle = '#ffcc99';                                                                // head
+  ctx.fillStyle = TH.skin;                                                                  // head
   ctx.beginPath(); ctx.arc(cx, headY, headR, 0, Math.PI * 2); ctx.fill();
   if (dancing) {
-    ctx.strokeStyle = '#7a3d00';
-    ctx.lineWidth = Math.max(1.5, u * 0.14);
+    ctx.strokeStyle = TH.mouth;
+    ctx.lineWidth = Math.max(1.5, u * 0.14) * TH.strokeScale;
     ctx.beginPath();
     ctx.arc(cx, headY + headR * 0.05, headR * 0.55, 0.15 * Math.PI, 0.85 * Math.PI);
     ctx.stroke();
@@ -402,9 +461,9 @@ function drawOpponent(cpuWorldX, t, dancing) {
 
   // Racket last so it reads as held in front of the arm.
   const pr = u * 0.78;
-  ctx.fillStyle = '#ff6b6b';
+  ctx.fillStyle = TH.racket;
   ctx.beginPath(); ctx.ellipse(handScreenX, handScreenY, pr, pr * 0.68, 0, 0, Math.PI * 2); ctx.fill();
-  ctx.strokeStyle = 'rgba(0,0,0,0.4)'; ctx.lineWidth = Math.max(1.5, u * 0.14); ctx.stroke();
+  ctx.strokeStyle = TH.racketEdge; ctx.lineWidth = Math.max(1.5, u * 0.14) * TH.strokeScale; ctx.stroke();
 }
 
 function drawBall() {
@@ -413,29 +472,62 @@ function drawBall() {
   const r = Math.max(3, 10 * p.scale / H * 3);
   // shadow on the table
   const shadow = project(b.x, TABLE_Y, b.z);
-  ctx.fillStyle = 'rgba(0,0,0,0.35)';
+  ctx.fillStyle = TH.ballShadow;
   ctx.beginPath(); ctx.ellipse(shadow.x, shadow.y, r * 0.9, r * 0.35, 0, 0, Math.PI * 2); ctx.fill();
-  ctx.fillStyle = '#ffd43b';
+  ctx.fillStyle = TH.ball;
   ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2); ctx.fill();
+  if (TH.ballEdge) { ctx.strokeStyle = TH.ballEdge; ctx.lineWidth = 2; ctx.stroke(); }
 }
 
 function render(animT) {
   ctx.clearRect(0, 0, W, H);
   const g = ctx.createLinearGradient(0, 0, 0, H);
-  g.addColorStop(0, '#0a0e14'); g.addColorStop(1, '#111826');
+  g.addColorStop(0, TH.skyTop); g.addColorStop(1, TH.skyBot);
   ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
 
   drawTable();
   drawOpponent(state.cpuX, animT, state.dancing);
   if (state.ball.active) drawBall();
-  drawPaddle(state.paddleX, state.paddleY, PADDLE_Z, '#4dabf7', true);
+  drawPaddle(state.paddleX, state.paddleY, PADDLE_Z, TH.paddle, true);
 }
 
 /* ---------------- input: live telemetry over WebSocket ---------------- */
 // Same 20-byte binary protocol as tools/scope.html — see docs/PROTOCOL.md.
 let ws = null, connected = false, zeroRoll = 0, zeroPitch = 0, calibratedOnce = false;
-let liveRoll = 0, livePitch = 0;
+let liveRoll = 0, livePitch = 0, liveWx = 0, liveWy = 0;
 let swingActive = false, swingPeakDps = 0;
+
+// When the newest telemetry frame arrived, on the browser's own clock. Every
+// latency decision below is made against this rather than against the ESP32's
+// t_ms, because the two clocks are never synchronised and do not need to be.
+let lastFrameAt = 0;
+let rxCount = 0, rxWindowStart = 0, rxHz = 0;
+let seqPrev = null, seqGaps = 0;
+
+// Round-trip time, measured continuously rather than assumed. PLAN.md section
+// 4 budgeted 40-80 ms end-to-end and specified shipping angular velocity so
+// the client could dead-reckon forward by it; the protocol has carried wx/wy/wz
+// for exactly that since Phase 1, and until now the game threw them away and
+// rendered whatever orientation last arrived. Indoors that is a barely-visible
+// ~50 ms. Outdoors, where the link is far worse, it is the whole complaint.
+let rttMs = null;
+let pingTimer = null;
+const PING_INTERVAL_MS = 500;
+
+// Extrapolation limits. The horizon is how far forward to project; the degree
+// clamp is the safety rail, because a hard swing passes 800 deg/s and
+// projecting even 100 ms of that would fling the paddle to the wall. Aiming
+// happens at a small fraction of that rate, so the clamp only ever engages
+// during motion that is not aiming.
+const EXTRAPOLATE_MAX_MS  = 120;
+const EXTRAPOLATE_MAX_DEG = 12;
+// Past this age the last frame is not "slightly old", it is unknown. Freeze
+// rather than keep projecting a stale rate forward into a confident-looking
+// wrong answer.
+const STALE_MS = 300;
+
+// Link stats reported by the firmware (OP_STAT, docs/PROTOCOL.md).
+let stat = { clients: 0, rssi: 0, txHz: 0, dropped: 0, tempC: 0, heap: 0, intervalMs: 0, at: 0 };
 
 // Raised from an earlier 28: with the physical mount changing (breadboard ->
 // real bat), overall tilt behavior will shift, and a wider degrees-to-full-
@@ -447,6 +539,14 @@ const MAX_TILT_DEG = 36;
 // control now (see below), which has headroom to be closer to raw input
 // without feeling twitchy — most perceived "sensitivity" was two axes of
 // noise compounding, not the filter itself.
+//
+// This is now a per-60th-of-a-second figure rather than a per-frame one. As a
+// raw per-frame constant it silently became a *lag* control whenever the frame
+// rate dropped: at 60 fps it settles in ~25 ms, but a phone throttling to 20
+// fps — which is exactly what a phone does when it is hot, screen at full
+// brightness, sitting in the sun — stretched the same constant to ~75 ms of
+// added lag on top of everything the network was already costing. Rebasing it
+// on elapsed time makes the feel identical at any frame rate.
 const PADDLE_SMOOTHING = 0.70;
 let smoothNx = 0;
 
@@ -455,32 +555,108 @@ let smoothNx = 0;
 // Rather than guess and reflash, these are client-side toggles you can flip
 // live and that persist across reloads. Only X matters now — paddle height
 // is fixed, single-axis control per the current design.
-function loadBool(key, def) { const v = localStorage.getItem(key); return v === null ? def : v === '1'; }
+function loadBool(key, def) {
+  try { const v = localStorage.getItem(key); return v === null ? def : v === '1'; }
+  catch (e) { return def; }
+}
+function saveBool(key, v) { try { localStorage.setItem(key, v ? '1' : '0'); } catch (e) {} }
 let swapAxes = loadBool('airtt_swapAxes', false);
 let invertX  = loadBool('airtt_invertX', false);
+let showStats = loadBool('airtt_stats', false);
 function syncToggleUI() {
   document.getElementById('swapAxes').classList.toggle('on', swapAxes);
   document.getElementById('invertX').classList.toggle('on', invertX);
+  document.getElementById('stats').classList.toggle('on', showStats);
+  document.getElementById('diag').classList.toggle('on', showStats);
 }
-document.getElementById('swapAxes').onclick = () => { swapAxes = !swapAxes; localStorage.setItem('airtt_swapAxes', swapAxes ? '1' : '0'); syncToggleUI(); };
-document.getElementById('invertX').onclick  = () => { invertX  = !invertX;  localStorage.setItem('airtt_invertX',  invertX  ? '1' : '0'); syncToggleUI(); };
+document.getElementById('swapAxes').onclick = () => { swapAxes = !swapAxes; saveBool('airtt_swapAxes', swapAxes); syncToggleUI(); };
+document.getElementById('invertX').onclick  = () => { invertX  = !invertX;  saveBool('airtt_invertX',  invertX);  syncToggleUI(); };
+document.getElementById('stats').onclick    = () => { showStats = !showStats; saveBool('airtt_stats', showStats); syncToggleUI(); };
+document.getElementById('daylight').onclick = () => { daylight = !daylight; saveBool('airtt_daylight', daylight); applyTheme(); };
+// The document-level tap starts a match. Without this, tapping any of these
+// buttons between points also serves — including the one you press precisely
+// because you are trying to fix something before playing on.
+document.getElementById('controls').addEventListener('click', e => e.stopPropagation());
 syncToggleUI();
+applyTheme();
 
+function sendPing() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  const b = new ArrayBuffer(5), d = new DataView(b);
+  d.setUint8(0, 0x01);                        // OP_PING
+  d.setUint32(1, performance.now() >>> 0, true);   // echoed back verbatim
+  ws.send(b);
+}
+
+let reconnectDelay = 500;
 function connect() {
   const url = `ws://${location.hostname}/ws`;
   ws = new WebSocket(url);
   ws.binaryType = 'arraybuffer';
-  ws.onopen = () => { connected = true; setStatus(true); };
-  ws.onclose = () => { connected = false; setStatus(false); setTimeout(connect, 1000); };
+  ws.onopen = () => {
+    connected = true; setStatus(true);
+    reconnectDelay = 500;
+    clearInterval(pingTimer);
+    pingTimer = setInterval(sendPing, PING_INTERVAL_MS);
+    sendPing();
+  };
+  ws.onclose = () => {
+    connected = false; setStatus(false);
+    clearInterval(pingTimer); pingTimer = null;
+    // Backing off matters outdoors specifically: at the edge of range the
+    // socket drops repeatedly, and a fixed fast retry means the radio spends
+    // its airtime on handshakes for a link that is not ready — starving the
+    // telemetry that would work if it got a turn.
+    setTimeout(connect, reconnectDelay);
+    reconnectDelay = Math.min(reconnectDelay * 2, 5000);
+  };
   ws.onerror = () => {};
   ws.onmessage = ev => {
     if (!(ev.data instanceof ArrayBuffer)) return;
     const d = new DataView(ev.data);
-    if (d.byteLength < 20 || d.getUint8(0) !== 0xA7) return;
+    if (d.byteLength < 1) return;
+    const kind = d.getUint8(0);
+
+    if (kind === 0x01 && d.byteLength === 9) {
+      // Ping reply: our own timestamp echoed back, so RTT is one subtraction
+      // on one clock — no clock sync with the ESP32 needed.
+      const sent = d.getUint32(1, true);
+      const v = (performance.now() >>> 0) - sent;
+      if (v >= 0 && v < 5000) rttMs = (rttMs === null) ? v : rttMs + (v - rttMs) * 0.25;
+      return;
+    }
+
+    if (kind === 0x04 && d.byteLength >= 14) {
+      stat = {
+        clients:    d.getUint8(1),
+        rssi:       d.getInt8(2),
+        txHz:       d.getUint8(3),
+        dropped:    d.getUint16(4, true),
+        tempC:      d.getInt16(6, true) / 10,
+        heap:       d.getUint32(8, true),
+        intervalMs: d.getUint16(12, true),
+        at:         performance.now(),
+      };
+      return;
+    }
+
+    if (d.byteLength < 20 || kind !== 0xA7) return;
+    const seq = d.getUint16(2, true);
+    if (seqPrev !== null) {
+      const gap = (seq - seqPrev) & 0xFFFF;
+      if (gap > 1) seqGaps += gap - 1;
+    }
+    seqPrev = seq;
+
     liveRoll = d.getInt16(8, true) / 100;
     livePitch = d.getInt16(10, true) / 100;
+    liveWx = d.getInt16(12, true) / 10;
+    liveWy = d.getInt16(14, true) / 10;
     swingActive = !!(d.getUint8(1) & 0x01);
     swingPeakDps = d.getInt16(18, true) / 10;
+
+    lastFrameAt = performance.now();
+    rxCount++;
   };
 }
 function setStatus(on) {
@@ -494,29 +670,94 @@ addEventListener('click', () => { if (state.paused) { hideMsg(); state.dancing =
   document.getElementById('scoreYou').textContent = 0; document.getElementById('scoreCpu').textContent = 0;
   serve('you'); } }, { passive: true });
 
+// A phone left propped up outdoors dims and then sleeps mid-rally, and a
+// dimmed screen in sunlight is an invisible one. Best-effort: unsupported
+// browsers and rejected requests just carry on without it.
+let wakeLock = null;
+async function acquireWakeLock() {
+  try { if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen'); }
+  catch (e) { /* denied or unsupported — not worth interrupting play over */ }
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') return;
+  acquireWakeLock();
+  // Coming back from a backgrounded tab, the socket is usually already dead
+  // but has not necessarily reported it yet. Nudge it rather than wait out
+  // the TCP timeout.
+  if (ws && ws.readyState === WebSocket.CLOSED) { reconnectDelay = 500; connect(); }
+});
+acquireWakeLock();
+
+/* ---------------- diagnostics readout ---------------- */
+let fps = 0;
+function updateDiag(age) {
+  const el = document.getElementById('diag');
+  if (!showStats) return;
+  const warn = [];
+  if (rttMs !== null && rttMs > 120) warn.push('rtt');
+  if (stat.rssi !== 0 && stat.rssi < -75) warn.push('rssi');
+  if (stat.txHz && stat.txHz < 50) warn.push('tx');
+  if (fps < 45) warn.push('fps');
+  if (age > STALE_MS) warn.push('stale');
+  el.innerHTML =
+    `rtt ${rttMs === null ? '–' : rttMs.toFixed(0) + 'ms'}   age ${age.toFixed(0)}ms   rx ${rxHz.toFixed(0)}Hz\n` +
+    `tx ${stat.txHz || '–'}Hz   drops ${stat.dropped}   gaps ${seqGaps}\n` +
+    `rssi ${stat.rssi || '–'}dBm   clients ${stat.clients}   imu ${stat.tempC ? stat.tempC.toFixed(0) + '°C' : '–'}\n` +
+    `fps ${fps.toFixed(0)}` +
+    (warn.length ? `   <span class="warn">⚠ ${warn.join(' ')}</span>` : '');
+}
+
 /* ---------------- main loop ---------------- */
 let lastT = performance.now();
 function frame(now) {
   const dt = Math.min((now - lastT) / 1000, 0.05);
+  const rawDt = (now - lastT) / 1000;
   lastT = now;
+  if (rawDt > 0) fps += ((1 / rawDt) - fps) * 0.1;
+
+  if (!rxWindowStart) rxWindowStart = now;
+  if (now - rxWindowStart >= 1000) {
+    rxHz = rxCount * 1000 / (now - rxWindowStart);
+    rxCount = 0; rxWindowStart = now;
+  }
+
+  // Dead-reckoning, as designed in PLAN.md section 4 and never wired up until
+  // now. What is rendered is not the last orientation that arrived; it is
+  // where the paddle should be *now*, given that orientation, the angular rate
+  // measured alongside it, and how long the round trip is actually taking.
+  // Half the RTT covers paddle->phone; the frame's own age covers the gap
+  // since it landed, which grows as the send rate backs off on a weak link.
+  const age = lastFrameAt ? (now - lastFrameAt) : Infinity;
+  let horizonMs = 0;
+  if (age <= STALE_MS) {
+    horizonMs = Math.min((rttMs === null ? 0 : rttMs / 2) + age, EXTRAPOLATE_MAX_MS);
+  }
+  const h = horizonMs / 1000;
+  const clampDelta = v => Math.max(-EXTRAPOLATE_MAX_DEG, Math.min(EXTRAPOLATE_MAX_DEG, v));
+  const predRoll  = liveRoll  + clampDelta(liveWx * h);
+  const predPitch = livePitch + clampDelta(liveWy * h);
 
   // Single axis only: whichever of roll/pitch actually drives left-right
   // depends on the mount, hence the swap/invert toggles rather than a
   // reflash. Paddle height is fixed — see state.paddleY above.
-  let rollUse = swapAxes ? livePitch : liveRoll;
+  let rollUse = swapAxes ? predPitch : predRoll;
   if (invertX) rollUse = -rollUse;
 
   const targetNx = Math.max(-1, Math.min(1, rollUse / MAX_TILT_DEG));
   // Light smoothing on top of the firmware's own complementary filter — that
   // filter removes drift and swing-corruption, not the small frame-to-frame
   // jitter that reads as "twitchy" when it's driving a screen paddle directly.
-  smoothNx += (targetNx - smoothNx) * PADDLE_SMOOTHING;
+  // Rebased onto elapsed time so the constant means the same thing at 20 fps
+  // as at 60 — see PADDLE_SMOOTHING above for why that mattered outdoors.
+  const alpha = 1 - Math.pow(1 - PADDLE_SMOOTHING, Math.max(dt, 1e-4) * 60);
+  smoothNx += (targetNx - smoothNx) * alpha;
   state.paddleX = smoothNx * TABLE_W * 0.95;
 
   step(dt);
   render(now / 1000);
   document.getElementById('scoreYou').textContent = state.scoreYou;
   document.getElementById('scoreCpu').textContent = state.scoreCpu;
+  updateDiag(age === Infinity ? 0 : age);
   requestAnimationFrame(frame);
 }
 

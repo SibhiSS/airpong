@@ -12,6 +12,7 @@ struct ImuSample {
   float roll_deg;    // gravity-referenced, zeroed against imuZero()
   float pitch_deg;
   float wx_dps, wy_dps, wz_dps;   // gyro rate, bias-corrected, NOT zeroed
+  float temp_c;       // MPU die temperature — how hot the paddle actually is
   bool  fault;        // last I2C transaction failed
 };
 
@@ -33,3 +34,9 @@ ImuSample imuUpdate();
 // every client gets the same simple "just tilt from here" behavior for free.
 void imuZero();
 bool imuIsCalibrated();
+
+// Die temperature at the last imuUpdate(), and at the moment calibration ran.
+// The gap between them is the honest measure of how stale the boot calibration
+// has become — which, on a paddle sitting in the sun, it does within minutes.
+float imuTempC();
+float imuCalibTempC();
