@@ -32,6 +32,9 @@ static uint32_t stillSinceMs = 0;   // 0 = currently moving
 // accelerometer noisy?" — at ~0.6 deg RMS of sample noise against a 1.5 deg
 // threshold, that is a couple of false trips a second, each one resetting the
 // stillness timer that the auto-recentre needs 1.2 s of.
+static float accRollFast = 0, accRollSlow = 0;
+static float accPitchFast = 0, accPitchSlow = 0;
+static bool  accAvgSeeded = false;   // seed both averages from the first sample
 
 static float tempC = 0;             // die temperature, updated every sample
 static float calibTempC = 0;        // ... and what it was when calibrate() ran
